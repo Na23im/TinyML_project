@@ -1,95 +1,70 @@
 /* ============================================================
- *  Partie 2 — Classification de composants électroniques
- *  Arduino Nano 33 BLE + Caméra OV7670 + Edge Impulse + BLE
+ *  Partie 2 — Inférence : Classification de composants
+ *  Arduino Nano 33 BLE + OV7670 + Edge Impulse + BLE
  * ============================================================
  *
- *  LIBRAIRIES REQUISES (Arduino Library Manager) :
- *    1. Arduino_OV767X          (caméra OV7670)
- *    2. ArduinoBLE              (communication Bluetooth)
- *    3. <nom_projet>_inferencing (export Edge Impulse → .zip → Add .ZIP Library)
+ *  LIBRAIRIES REQUISES :
+ *    1. Arduino_OV767X          (Arduino Library Manager)
+ *    2. ArduinoBLE              (Arduino Library Manager)
+ *    3. ei-composants_elec-arduino-1.0.1.zip
+ *       → Sketch → Include Library → Add .ZIP Library
  *
- *  CÂBLAGE OV7670 → Arduino Nano 33 BLE :
- *    OV7670  | Arduino
- *    --------|--------
- *    3.3V    | 3.3V
- *    GND     | GND
- *    SIOC    | A5  (SCL)
- *    SIOD    | A4  (SDA)
- *    VSYNC   | 8
- *    HREF    | A1
- *    PCLK    | A0
- *    XCLK    | 9
- *    D7-D0   | 2,3,4,5,6,7,A2,A3
- *
- *  WORKFLOW :
- *    1. Caméra capture une image 96x96 (format RGB565)
- *    2. Image prétraitée et passée au classifieur Edge Impulse
- *    3. Classe prédite envoyée via BLE (Serial aussi pour debug)
+ *  CLASSES DÉTECTÉES :
+ *    - Capacitor
+ *    - Diode
+ *    - Resistor
+ *    - Transistor
+ *    - Unknown
  * ============================================================ */
 
-// ── 1. INCLUDES ──────────────────────────────────────────────
 #include <Arduino_OV767X.h>
 #include <ArduinoBLE.h>
+#include <composants_elec_inferencing.h>
 
-// ⚠️  Remplace "mon_projet_inferencing.h" par le nom exact de ton export Edge Impulse
-// Ex : si ton projet s'appelle "composants_ei", ce sera "composants_ei_inferencing.h"
-#include "mon_projet_inferencing.h"
+// ── Résolution ───────────────────────────────────────────────
+#define RAW_WIDTH   160
+#define RAW_HEIGHT  120
+#define OUT_WIDTH    96
+#define OUT_HEIGHT   96
 
-// ── 2. CONSTANTES ────────────────────────────────────────────
-// Dimensions d'entrée du modèle Edge Impulse (96x96 par défaut pour image classification)
-#define EI_CAMERA_RAW_FRAME_BUFFER_COLS   96
-#define EI_CAMERA_RAW_FRAME_BUFFER_ROWS   96
-#define EI_CAMERA_FRAME_BYTE_SIZE         2    // RGB565 = 2 octets/pixel
+// ── Seuil de confiance ───────────────────────────────────────
+#define CONFIDENCE_THRESHOLD 0.5f
 
-// Seuil de confiance minimum pour accepter une prédiction
-#define CONFIDENCE_THRESHOLD 0.6f
+// ── Buffers ──────────────────────────────────────────────────
+static uint8_t rawBuffer[RAW_WIDTH * RAW_HEIGHT * 2];
+static uint8_t outBuffer[OUT_WIDTH * OUT_HEIGHT * 3];
 
-// ── 3. BLE : SERVICE & CARACTÉRISTIQUE ───────────────────────
-// UUID fixes — tu peux les garder tels quels
+// ── BLE ──────────────────────────────────────────────────────
 BLEService componentService("12345678-1234-1234-1234-123456789012");
 BLEStringCharacteristic componentCharacteristic(
   "12345678-1234-1234-1234-123456789013",
   BLERead | BLENotify,
-  20   // longueur max de la string (ex: "Resistance")
+  20
 );
 
-// ── 4. BUFFER IMAGE ──────────────────────────────────────────
-static uint8_t imageBuffer[EI_CAMERA_RAW_FRAME_BUFFER_COLS *
-                            EI_CAMERA_RAW_FRAME_BUFFER_ROWS *
-                            EI_CAMERA_FRAME_BYTE_SIZE];
-
-// ── 5. PROTOTYPES ────────────────────────────────────────────
-bool captureImage();
+// ── Prototypes ───────────────────────────────────────────────
+void downsample();
 int  ei_camera_get_data(size_t offset, size_t length, float *out_ptr);
 void printPrediction(ei_impulse_result_t &result);
 String getBestLabel(ei_impulse_result_t &result);
 
 
-// ═══════════════════════════════════════════════════════════════
-//  SETUP
-// ═══════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════
 void setup() {
   Serial.begin(115200);
-  while (!Serial);   // Attend l'ouverture du moniteur série (retirer en production)
-
+  while (!Serial);
   Serial.println("=== Partie 2 : Classification de composants ===");
 
-  // ── Init caméra ──────────────────────────────────────────────
-  Serial.print("Init caméra OV7670... ");
-  if (!Camera.begin(QCIF, RGB565, 1)) {
-    Serial.println("ERREUR : caméra non détectée !");
-    Serial.println("Vérifier le câblage OV7670.");
+  // Init caméra
+  if (!Camera.begin(QQVGA, RGB565, 1)) {
+    Serial.println("ERR: Camera init failed");
     while (1);
   }
-  // Redimensionner à 96x96 pour Edge Impulse
-  Camera.setOutputSize(EI_CAMERA_RAW_FRAME_BUFFER_COLS,
-                       EI_CAMERA_RAW_FRAME_BUFFER_ROWS);
-  Serial.println("OK");
+  Serial.println("Camera OK");
 
-  // ── Init BLE ─────────────────────────────────────────────────
-  Serial.print("Init BLE... ");
+  // Init BLE
   if (!BLE.begin()) {
-    Serial.println("ERREUR : BLE non disponible !");
+    Serial.println("ERR: BLE init failed");
     while (1);
   }
   BLE.setLocalName("ComponentClassifier");
@@ -98,146 +73,97 @@ void setup() {
   BLE.addService(componentService);
   componentCharacteristic.writeValue("Initialisation...");
   BLE.advertise();
-  Serial.println("OK — en écoute BLE");
-
-  Serial.println("\nPrêt. Démarrage de la classification...\n");
-  delay(500);
+  Serial.println("BLE OK — en attente de connexion");
+  Serial.println("Pret.\n");
 }
 
-
-// ═══════════════════════════════════════════════════════════════
-//  LOOP
-// ═══════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════
 void loop() {
-  // Traite les connexions BLE entrantes
-  BLEDevice central = BLE.central();
-  if (central) {
-    Serial.print("Connecté à : ");
-    Serial.println(central.address());
-  }
+  BLE.poll();
 
-  // ── Capture l'image ──────────────────────────────────────────
-  if (!captureImage()) {
-    Serial.println("Erreur de capture image, retry...");
-    delay(500);
-    return;
-  }
+  // Capture
+  Camera.readFrame(rawBuffer);
+  downsample();
 
-  // ── Prépare le signal pour Edge Impulse ──────────────────────
+  // Signal Edge Impulse
   signal_t signal;
-  signal.total_length = EI_CAMERA_RAW_FRAME_BUFFER_COLS *
-                        EI_CAMERA_RAW_FRAME_BUFFER_ROWS;
+  signal.total_length = OUT_WIDTH * OUT_HEIGHT;
   signal.get_data = &ei_camera_get_data;
 
-  // ── Lancement de l'inférence ─────────────────────────────────
+  // Inférence
   ei_impulse_result_t result = { 0 };
   EI_IMPULSE_ERROR err = run_classifier(&signal, &result, false);
-
   if (err != EI_IMPULSE_OK) {
-    Serial.print("Erreur classifieur : ");
+    Serial.print("Erreur classifieur: ");
     Serial.println(err);
     delay(1000);
     return;
   }
 
-  // ── Affichage & envoi du résultat ────────────────────────────
+  // Résultats
   printPrediction(result);
-
   String label = getBestLabel(result);
+
   if (label != "") {
-    // Envoi via Serial (pour Node-RED en mode Serial si besoin)
     Serial.print(">> CLASSE DETECTEE : ");
     Serial.println(label);
-
-    // Envoi via BLE
     componentCharacteristic.writeValue(label);
   } else {
-    Serial.println(">> Confiance insuffisante, pas d'envoi.");
+    Serial.println(">> Confiance insuffisante");
   }
 
-  // Pause entre deux captures (ajuster selon la vitesse de défilement des composants)
   delay(2000);
 }
 
+// ════════════════════════════════════════════════════════════
+void downsample() {
+  for (int y = 0; y < OUT_HEIGHT; y++) {
+    for (int x = 0; x < OUT_WIDTH; x++) {
+      int srcX = x * RAW_WIDTH  / OUT_WIDTH;
+      int srcY = y * RAW_HEIGHT / OUT_HEIGHT;
+      int srcIdx = (srcY * RAW_WIDTH + srcX) * 2;
 
-// ═══════════════════════════════════════════════════════════════
-//  FONCTIONS UTILITAIRES
-// ═══════════════════════════════════════════════════════════════
+      uint16_t pixel = ((uint16_t)rawBuffer[srcIdx] << 8) | rawBuffer[srcIdx + 1];
+      uint8_t r = ((pixel >> 11) & 0x1F) << 3;
+      uint8_t g = ((pixel >>  5) & 0x3F) << 2;
+      uint8_t b = ( pixel        & 0x1F) << 3;
 
-/**
- * Capture une image depuis l'OV7670 dans imageBuffer.
- * Retourne true si succès, false sinon.
- */
-bool captureImage() {
-  Camera.readFrame(imageBuffer);
-  return true;
+      int dstIdx = (y * OUT_WIDTH + x) * 3;
+      outBuffer[dstIdx]     = r;
+      outBuffer[dstIdx + 1] = g;
+      outBuffer[dstIdx + 2] = b;
+    }
+  }
 }
 
-/**
- * Callback requis par Edge Impulse pour lire les pixels.
- * Convertit RGB565 en float RGB888 normalisé [0..255].
- */
 int ei_camera_get_data(size_t offset, size_t length, float *out_ptr) {
-  size_t pixel_ix  = offset * 2;   // RGB565 = 2 octets par pixel
-  size_t pixels_left = length;
-  size_t out_ptr_ix = 0;
-
-  while (pixels_left != 0) {
-    // Lecture des 2 octets RGB565
-    uint16_t pixel = (imageBuffer[pixel_ix] << 8) | imageBuffer[pixel_ix + 1];
-
-    // Extraction des canaux RGB
-    uint8_t r = ((pixel >> 11) & 0x1F) << 3;  // 5 bits → 8 bits
-    uint8_t g = ((pixel >>  5) & 0x3F) << 2;  // 6 bits → 8 bits
-    uint8_t b = ( pixel        & 0x1F) << 3;  // 5 bits → 8 bits
-
-    // Format attendu par Edge Impulse : 0xRRGGBB en float
-    out_ptr[out_ptr_ix] = (r << 16) | (g << 8) | b;
-
-    out_ptr_ix++;
-    pixel_ix += 2;
-    pixels_left--;
+  for (size_t i = 0; i < length; i++) {
+    int idx = (offset + i) * 3;
+    out_ptr[i] = (outBuffer[idx] << 16) | (outBuffer[idx+1] << 8) | outBuffer[idx+2];
   }
   return 0;
 }
 
-/**
- * Affiche toutes les probabilités dans le moniteur série.
- */
 void printPrediction(ei_impulse_result_t &result) {
   Serial.println("--- Résultats ---");
   for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
     Serial.print("  ");
     Serial.print(result.classification[i].label);
-    Serial.print(" : ");
+    Serial.print(": ");
     Serial.print(result.classification[i].value * 100, 1);
-    Serial.println(" %");
+    Serial.println("%");
   }
-  Serial.print("  Timing DSP: ");
-  Serial.print(result.timing.dsp);
-  Serial.print(" ms | Inférence: ");
-  Serial.print(result.timing.classification);
-  Serial.println(" ms");
   Serial.println("-----------------");
 }
 
-/**
- * Retourne la classe ayant la plus haute confiance (si > CONFIDENCE_THRESHOLD).
- * Retourne "" si aucune classe n'est assez confiante.
- */
 String getBestLabel(ei_impulse_result_t &result) {
-  float  maxConf  = 0.0f;
+  float  maxConf   = 0.0f;
   String bestLabel = "";
-
   for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
     if (result.classification[i].value > maxConf) {
       maxConf   = result.classification[i].value;
       bestLabel = String(result.classification[i].label);
     }
   }
-
-  if (maxConf >= CONFIDENCE_THRESHOLD) {
-    return bestLabel;
-  }
-  return "";
+  return (maxConf >= CONFIDENCE_THRESHOLD) ? bestLabel : "";
 }
